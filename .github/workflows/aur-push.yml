@@ -1,76 +1,213 @@
-name: Auto-Update and Push to AUR
+name: SquidServers Hybrid Update
 
 on:
   schedule:
     - cron: '0 0 * * 1'
+  pull_request:
+    paths:
+      - 'PKGBUILD'
   workflow_dispatch:
-  push:
-    branches:
-      - main
+    inputs:
+      version:
+        description: 'Force a specific version (e.g. 1.5.6)'
+        required: false
+        type: string
 
 jobs:
-  update-check:
+  update:
     runs-on: ubuntu-latest
-    container: 
-      image: archlinux:latest
-      options: --user root
+    container: archlinux:latest
+    timeout-minutes: 350  # 5h50m safety net — 10min margin before GitHub's 6h hard kill
+
     steps:
       - name: Install System Dependencies
-        run: |
-          pacman -Syu --noconfirm git base-devel openssh curl sudo
+        run: pacman -Syu --noconfirm git base-devel openssh curl sudo
 
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check for new version
-        id: check_version
+      - name: Determine Target Version
+        id: target
         run: |
-          # 1. Get current version
           OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
-          echo "Local version: $OLD_VER"
-          
-          # 2. Extract version from Next.js metadata
-          # We use a very generic curl and search for the version string pattern
-          # that usually appears in their build manifests.
-          USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-          
-          # This command looks for the version number following the 'v' in the text
-          # It's more likely to bypass Cloudflare's simple bot detection
-          NEW_VER=$(curl -sL -A "$USER_AGENT" https://squidservers.com/download | grep -oP 'Latest Version v\K[0-9.]+' | head -1)
-          
-          # If that fails, we try a broader search for any squidservers_X.X.X_amd64 string
-          if [ -z "$NEW_VER" ]; then
-             NEW_VER=$(curl -sL -A "$USER_AGENT" https://squidservers.com/download | grep -oP 'squidservers_\K[0-9.]+(?=_amd64)' | head -1)
+          echo "Current version: $OLD_VER"
+
+          # ── Manual override ───────────────────────────────────────────────
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "update_found=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          echo "Detected version: '$NEW_VER'"
-
-          if [ -z "$NEW_VER" ]; then
-            echo "Error: Cloudflare is still blocking the request."
-            echo "Try visiting the site in your browser and check if the version is still 0.6.1"
-            exit 1
+          # ── PR: validate the current PKGBUILD version as-is ──────────────
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "version=$OLD_VER" >> $GITHUB_OUTPUT
+            echo "update_found=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          if [ "$OLD_VER" != "$NEW_VER" ]; then
-            echo "version_changed=true" >> $GITHUB_OUTPUT
-            echo "new_version=$NEW_VER" >> $GITHUB_OUTPUT
-            sed -i "s/pkgver=$OLD_VER/pkgver=$NEW_VER/" PKGBUILD
+          CDN="https://cdn.squidservers.com"
+
+          # Returns 0 (true) if the .deb exists for a given version.
+          # --connect-timeout 3  give up if TCP handshake stalls for 3s
+          # --max-time 5         hard ceiling of 5s for the entire request
+          probe() {
+            curl --output /dev/null --silent --head --fail \
+              --connect-timeout 3 \
+              --max-time 5 \
+              "${CDN}/squidservers_${1}_amd64.deb"
+          }
+
+          # Returns 0 (true) if $1 is strictly greater than $2 by semver
+          is_newer() {
+            [ "$(printf '%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ] \
+              && [ "$1" != "$2" ]
+          }
+
+          # ── Gap-tolerant incremental probe sweep ─────────────────────────
+          #
+          #   MAX_MISS_PATCH  = 20   consecutive patch misses before moving on
+          #   MAX_MISS_MINOR  = 10   consecutive empty minors before moving on
+          #   MAX_MISS_MAJOR  =  3   consecutive empty majors before stopping
+          #
+          #   Worst-case requests from 0.0.0 with nothing new at all:
+          #     Patch axis :  20                    =     20
+          #     Minor axis :  10 × 20               =    200
+          #     Major axis :   3 × 10 × 20          =    600
+          #                                 Total   =    820
+          #
+          #   At --max-time 5 per request:  820 × 5s = ~68 minutes worst case
+          #   Last version ever probed from 0.0.0:  3.9.19
+          #
+          # BEST accumulates the highest confirmed hit across the full sweep.
+
+          MAJOR=$(echo "$OLD_VER" | cut -d. -f1)
+          MINOR=$(echo "$OLD_VER" | cut -d. -f2)
+          PATCH=$(echo "$OLD_VER" | cut -d. -f3)
+          MAX_MISS_PATCH=20
+          MAX_MISS_MINOR=10
+          MAX_MISS_MAJOR=3
+          BEST=""
+
+          # ── Patch axis: MAJOR.MINOR.(PATCH+1), (PATCH+2), ...
+          echo "--- Patch axis (max $MAX_MISS_PATCH consecutive misses) ---"
+          miss=0
+          p=$((PATCH + 1))
+          while [ $miss -lt $MAX_MISS_PATCH ]; do
+            V="$MAJOR.$MINOR.$p"
+            if probe "$V"; then
+              is_newer "$V" "${BEST:-$OLD_VER}" && BEST="$V"
+              echo "  ✓ $V"
+              miss=0
+            else
+              echo "  ✗ $V"
+              miss=$((miss + 1))
+            fi
+            p=$((p + 1))
+          done
+          echo "[Patch axis exhausted — $MAX_MISS_PATCH consecutive misses]"
+
+          # ── Minor axis: MAJOR.(MINOR+1...).0,1,2,...
+          # Stops after MAX_MISS_MINOR consecutive minors that yield zero hits.
+          echo "--- Minor axis (max $MAX_MISS_MINOR consecutive empty minors) ---"
+          minor_miss=0
+          m=$((MINOR + 1))
+          while [ $minor_miss -lt $MAX_MISS_MINOR ]; do
+            echo "  [minor $MAJOR.$m.x]"
+            minor_had_hit=0
+            miss=0; p=0
+            while [ $miss -lt $MAX_MISS_PATCH ]; do
+              V="$MAJOR.$m.$p"
+              if probe "$V"; then
+                is_newer "$V" "${BEST:-$OLD_VER}" && BEST="$V"
+                echo "    ✓ $V"
+                miss=0; minor_had_hit=1
+              else
+                echo "    ✗ $V"
+                miss=$((miss + 1))
+              fi
+              p=$((p + 1))
+            done
+            if [ $minor_had_hit -eq 0 ]; then
+              minor_miss=$((minor_miss + 1))
+              echo "  [minor $MAJOR.$m empty — minor_miss=$minor_miss]"
+            else
+              minor_miss=0
+              echo "  [minor $MAJOR.$m had hits — minor_miss reset to 0]"
+            fi
+            m=$((m + 1))
+          done
+          echo "[Minor axis exhausted — $MAX_MISS_MINOR consecutive empty minors]"
+
+          # ── Major axis: (MAJOR+1...).0.0, 0.1, ...
+          # Stops after MAX_MISS_MAJOR consecutive majors that yield zero hits.
+          echo "--- Major axis (max $MAX_MISS_MAJOR consecutive empty majors) ---"
+          major_miss=0
+          mj=$((MAJOR + 1))
+          while [ $major_miss -lt $MAX_MISS_MAJOR ]; do
+            echo "  [major $mj.x.x]"
+            major_had_hit=0
+            minor_miss=0; m=0
+            while [ $minor_miss -lt $MAX_MISS_MINOR ]; do
+              echo "    [minor $mj.$m.x]"
+              minor_had_hit=0
+              miss=0; p=0
+              while [ $miss -lt $MAX_MISS_PATCH ]; do
+                V="$mj.$m.$p"
+                if probe "$V"; then
+                  is_newer "$V" "${BEST:-$OLD_VER}" && BEST="$V"
+                  echo "      ✓ $V"
+                  miss=0; minor_had_hit=1; major_had_hit=1
+                else
+                  echo "      ✗ $V"
+                  miss=$((miss + 1))
+                fi
+                p=$((p + 1))
+              done
+              if [ $minor_had_hit -eq 0 ]; then
+                minor_miss=$((minor_miss + 1))
+                echo "    [minor $mj.$m empty — minor_miss=$minor_miss]"
+              else
+                minor_miss=0
+                echo "    [minor $mj.$m had hits — minor_miss reset to 0]"
+              fi
+              m=$((m + 1))
+            done
+            if [ $major_had_hit -eq 0 ]; then
+              major_miss=$((major_miss + 1))
+              echo "  [major $mj empty — major_miss=$major_miss]"
+            else
+              major_miss=0
+              echo "  [major $mj had hits — major_miss reset to 0]"
+            fi
+            mj=$((mj + 1))
+          done
+          echo "[Major axis exhausted — $MAX_MISS_MAJOR consecutive empty majors]"
+
+          echo "--- Sweep complete ---"
+          if [ -n "$BEST" ]; then
+            echo "Found new version: $BEST"
+            echo "version=$BEST" >> $GITHUB_OUTPUT
+            echo "update_found=true" >> $GITHUB_OUTPUT
           else
-            echo "No update needed. Site is on $NEW_VER"
+            echo "No new version found."
+            echo "update_found=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Update Checksums and .SRCINFO
-        if: steps.check_version.outputs.version_changed == 'true'
+      - name: Update PKGBUILD and Checksums
+        if: steps.target.outputs.update_found == 'true'
         run: |
+          NEW_VER=${{ steps.target.outputs.version }}
+          sed -i "s/pkgver=.*/pkgver=$NEW_VER/" PKGBUILD
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           chown -R builder .
           sudo -u builder bash -c "updpkgsums && makepkg --printsrcinfo > .SRCINFO"
 
       - name: Push to GitHub and AUR
-        if: steps.check_version.outputs.version_changed == 'true'
+        if: steps.target.outputs.update_found == 'true' && github.event_name != 'pull_request'
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
@@ -82,7 +219,7 @@ jobs:
           git config --global user.email "bot@github.com"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git add PKGBUILD .SRCINFO
-          git commit -m "Auto-update to ${{ steps.check_version.outputs.new_version }}"
+          git commit -m "Update to ${{ steps.target.outputs.version }}"
           git push origin main
           git remote add aur ssh://aur@aur.archlinux.org/squidservers-bin.git
           git push aur main:master --force
