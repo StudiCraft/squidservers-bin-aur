@@ -17,7 +17,9 @@ jobs:
   update:
     runs-on: ubuntu-latest
     container: archlinux:latest
-    timeout-minutes: 350  # 5h50m safety net — 10min margin before GitHub's 6h hard kill
+    timeout-minutes: 350
+    permissions:
+      contents: write
 
     steps:
       - name: Install System Dependencies
@@ -34,14 +36,12 @@ jobs:
           OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
           echo "Current version: $OLD_VER"
 
-          # ── Manual override ───────────────────────────────────────────────
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
             echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
             echo "update_found=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # ── PR: validate the current PKGBUILD version as-is ──────────────
           if [ "${{ github.event_name }}" == "pull_request" ]; then
             echo "version=$OLD_VER" >> $GITHUB_OUTPUT
             echo "update_found=true" >> $GITHUB_OUTPUT
@@ -50,9 +50,6 @@ jobs:
 
           CDN="https://cdn.squidservers.com"
 
-          # Returns 0 (true) if the .deb exists for a given version.
-          # --connect-timeout 3  give up if TCP handshake stalls for 3s
-          # --max-time 5         hard ceiling of 5s for the entire request
           probe() {
             curl --output /dev/null --silent --head --fail \
               --connect-timeout 3 \
@@ -60,28 +57,10 @@ jobs:
               "${CDN}/squidservers_${1}_amd64.deb"
           }
 
-          # Returns 0 (true) if $1 is strictly greater than $2 by semver
           is_newer() {
             [ "$(printf '%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ] \
               && [ "$1" != "$2" ]
           }
-
-          # ── Gap-tolerant incremental probe sweep ─────────────────────────
-          #
-          #   MAX_MISS_PATCH  = 20   consecutive patch misses before moving on
-          #   MAX_MISS_MINOR  = 10   consecutive empty minors before moving on
-          #   MAX_MISS_MAJOR  =  3   consecutive empty majors before stopping
-          #
-          #   Worst-case requests from 0.0.0 with nothing new at all:
-          #     Patch axis :  20                    =     20
-          #     Minor axis :  10 × 20               =    200
-          #     Major axis :   3 × 10 × 20          =    600
-          #                                 Total   =    820
-          #
-          #   At --max-time 5 per request:  820 × 5s = ~68 minutes worst case
-          #   Last version ever probed from 0.0.0:  3.9.19
-          #
-          # BEST accumulates the highest confirmed hit across the full sweep.
 
           MAJOR=$(echo "$OLD_VER" | cut -d. -f1)
           MINOR=$(echo "$OLD_VER" | cut -d. -f2)
@@ -91,7 +70,6 @@ jobs:
           MAX_MISS_MAJOR=3
           BEST=""
 
-          # ── Patch axis: MAJOR.MINOR.(PATCH+1), (PATCH+2), ...
           echo "--- Patch axis (max $MAX_MISS_PATCH consecutive misses) ---"
           miss=0
           p=$((PATCH + 1))
@@ -109,8 +87,6 @@ jobs:
           done
           echo "[Patch axis exhausted — $MAX_MISS_PATCH consecutive misses]"
 
-          # ── Minor axis: MAJOR.(MINOR+1...).0,1,2,...
-          # Stops after MAX_MISS_MINOR consecutive minors that yield zero hits.
           echo "--- Minor axis (max $MAX_MISS_MINOR consecutive empty minors) ---"
           minor_miss=0
           m=$((MINOR + 1))
@@ -141,8 +117,6 @@ jobs:
           done
           echo "[Minor axis exhausted — $MAX_MISS_MINOR consecutive empty minors]"
 
-          # ── Major axis: (MAJOR+1...).0.0, 0.1, ...
-          # Stops after MAX_MISS_MAJOR consecutive majors that yield zero hits.
           echo "--- Major axis (max $MAX_MISS_MAJOR consecutive empty majors) ---"
           major_miss=0
           mj=$((MAJOR + 1))
