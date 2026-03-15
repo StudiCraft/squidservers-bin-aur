@@ -27,18 +27,29 @@ jobs:
       - name: Check for new version
         id: check_version
         run: |
-          # 1. Get current version from PKGBUILD
+          # 1. Get current version
           OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
-          echo "Local PKGBUILD version: $OLD_VER"
+          echo "Local version: $OLD_VER"
           
-          # 2. Get the latest version from SquidServers' GitHub Releases
-          # This pulls the 'tag_name', removes the 'v' prefix, and handles the JSON
-          NEW_VER=$(curl -s https://api.github.com/repos/SquidServers/squidservers/releases/latest | grep -oP '"tag_name":\s*"v\K[0-9.]+' | head -1)
+          # 2. Extract version from Next.js metadata
+          # We use a very generic curl and search for the version string pattern
+          # that usually appears in their build manifests.
+          USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
           
-          echo "Latest GitHub version: '$NEW_VER'"
+          # This command looks for the version number following the 'v' in the text
+          # It's more likely to bypass Cloudflare's simple bot detection
+          NEW_VER=$(curl -sL -A "$USER_AGENT" https://squidservers.com/download | grep -oP 'Latest Version v\K[0-9.]+' | head -1)
+          
+          # If that fails, we try a broader search for any squidservers_X.X.X_amd64 string
+          if [ -z "$NEW_VER" ]; then
+             NEW_VER=$(curl -sL -A "$USER_AGENT" https://squidservers.com/download | grep -oP 'squidservers_\K[0-9.]+(?=_amd64)' | head -1)
+          fi
+
+          echo "Detected version: '$NEW_VER'"
 
           if [ -z "$NEW_VER" ]; then
-            echo "Error: Could not reach GitHub API or find version."
+            echo "Error: Cloudflare is still blocking the request."
+            echo "Try visiting the site in your browser and check if the version is still 0.6.1"
             exit 1
           fi
 
@@ -46,9 +57,8 @@ jobs:
             echo "version_changed=true" >> $GITHUB_OUTPUT
             echo "new_version=$NEW_VER" >> $GITHUB_OUTPUT
             sed -i "s/pkgver=$OLD_VER/pkgver=$NEW_VER/" PKGBUILD
-            echo "Update found! New version is $NEW_VER"
           else
-            echo "Already up to date: $OLD_VER"
+            echo "No update needed. Site is on $NEW_VER"
           fi
 
       - name: Update Checksums and .SRCINFO
