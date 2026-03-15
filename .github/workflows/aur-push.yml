@@ -33,8 +33,8 @@ jobs:
           # 1. Get current version from PKGBUILD
           OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
           
-          # 2. Scrape the website for the latest version
-          NEW_VER=$(curl -sL https://squidservers.com/download | grep -oP 'squidservers_\K[0-9.]+(?=_amd64.deb)' | head -1)
+          # 2. Scrape the version from the "Latest Version" badge on the page
+          NEW_VER=$(curl -sL https://squidservers.com/download | grep -oP 'Latest Version v\K[0-9.]+' | head -1)
           
           if [ -z "$NEW_VER" ]; then
             echo "Error: Could not find version on website. Check the scraping URL."
