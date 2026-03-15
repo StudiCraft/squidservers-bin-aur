@@ -33,7 +33,7 @@ jobs:
           # 1. Get current version from PKGBUILD
           OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
           
-          # 2. Scrape the version from the "Latest Version" badge on the page
+          # 2. Scrape the version from the green "Latest Version" span
           NEW_VER=$(curl -sL https://squidservers.com/download | grep -oP 'Latest Version v\K[0-9.]+' | head -1)
           
           if [ -z "$NEW_VER" ]; then
