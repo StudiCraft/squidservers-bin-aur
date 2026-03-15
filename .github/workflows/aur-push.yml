@@ -186,10 +186,8 @@ jobs:
           git config --global user.name "SquidServers Bot"
           git config --global user.email "bot@github.com"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git fetch origin
-          git rebase origin/main
           git add PKGBUILD .SRCINFO
-          git commit -m "Update to ${{ steps.target.outputs.version }}" || echo "Nothing to commit"
+          git commit -m "Update to ${{ steps.target.outputs.version }}"
           git push origin main --force
 
       - name: Push to AUR
