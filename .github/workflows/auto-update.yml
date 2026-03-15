@@ -1,0 +1,63 @@
+name: Auto-Update and Push to AUR
+on:
+  schedule:
+    - cron: '0 0 * * 1' # Every Monday at Midnight
+  workflow_dispatch: # Allows you to click a button to run it manually
+
+jobs:
+  update-check:
+    runs-on: ubuntu-latest
+    container: archlinux:latest # Use Arch Linux to have access to 'makepkg'
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm git base-devel openssh
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new version
+        id: check_version
+        run: |
+          OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
+          # Scrape version from the CDN URL pattern
+          NEW_VER=$(curl -s https://squidservers.com/download | grep -oP 'squidservers_\K[0-9.]+(?=_amd64.deb)' | head -1)
+          
+          if [ "$OLD_VER" != "$NEW_VER" ]; then
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+            echo "new_version=$NEW_VER" >> $GITHUB_OUTPUT
+            sed -i "s/pkgver=$OLD_VER/pkgver=$NEW_VER/" PKGBUILD
+          fi
+
+      - name: Update Checksums and .SRCINFO
+        if: steps.check_version.outputs.version_changed == 'true'
+        run: |
+          # Allow makepkg to run as root (required for Docker)
+          useradd -m builder
+          chown -R builder .
+          sudo -u builder bash -c "updpkgsums && makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Push to GitHub and AUR
+        if: steps.check_version.outputs.version_changed == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          # Setup SSH
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          
+          # Git Config
+          git config --global user.name "SquidServers Bot"
+          git config --global user.email "bot@github.com"
+          
+          # Push to GitHub
+          git add PKGBUILD .SRCINFO
+          git commit -m "Auto-update to ${{ steps.check_version.outputs.new_version }}"
+          git push origin main
+          
+          # Push to AUR
+          git remote add aur ssh://aur@aur.archlinux.org/squidservers-bin.git
+          git push aur main
