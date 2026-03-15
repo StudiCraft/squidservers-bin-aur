@@ -2,8 +2,11 @@ name: Auto-Update and Push to AUR
 
 on:
   schedule:
-    - cron: '0 0 * * 1' # Runs every Monday at midnight
-  workflow_dispatch: # Allows you to trigger it manually via the Actions tab
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   update-check:
@@ -24,20 +27,24 @@ jobs:
       - name: Check for new version
         id: check_version
         run: |
-          # Debug: Show where we are and what files exist
-          ls -R 
-          
-          # If your files are in a subfolder, uncomment the next line and change 'folder_name'
-          # cd folder_name 
-
           # 1. Get current version from PKGBUILD
           OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
+          echo "Local PKGBUILD version: $OLD_VER"
           
-          # 2. Scrape the version from the green "Latest Version" span
-          NEW_VER=$(curl -sL https://squidservers.com/download | grep -oP 'Latest Version v\K[0-9.]+' | head -1)
+          # 2. Scrape the website with a User-Agent (to avoid bot detection)
+          # We save it to a file first for debugging if it fails
+          curl -sL -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" https://squidservers.com/download > site_source.html
           
+          # Try to extract the version
+          NEW_VER=$(grep -oP 'Latest Version v\K[0-9.]+' site_source.html | head -1)
+          
+          echo "Scraped version: '$NEW_VER'"
+
           if [ -z "$NEW_VER" ]; then
-            echo "Error: Could not find version on website. Check the scraping URL."
+            echo "--- DEBUG: WEBSITE CONTENT START ---"
+            cat site_source.html | head -n 50
+            echo "--- DEBUG: WEBSITE CONTENT END ---"
+            echo "Error: Could not find version on website."
             exit 1
           fi
 
@@ -45,20 +52,17 @@ jobs:
             echo "version_changed=true" >> $GITHUB_OUTPUT
             echo "new_version=$NEW_VER" >> $GITHUB_OUTPUT
             sed -i "s/pkgver=$OLD_VER/pkgver=$NEW_VER/" PKGBUILD
-            echo "Detected new version: $NEW_VER"
+            echo "Update found! New version is $NEW_VER"
           else
-            echo "Already up to date: $OLD_VER"
+            echo "No update needed. Site is still on $NEW_VER"
           fi
 
       - name: Update Checksums and .SRCINFO
         if: steps.check_version.outputs.version_changed == 'true'
         run: |
-          # Create a non-root user to run makepkg
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           chown -R builder .
-          
-          # Run as builder to generate hashes and metadata
           sudo -u builder bash -c "updpkgsums && makepkg --printsrcinfo > .SRCINFO"
 
       - name: Push to GitHub and AUR
@@ -66,22 +70,15 @@ jobs:
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
-          # 1. SSH Setup
           eval $(ssh-agent -s)
           echo "$AUR_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
           mkdir -p ~/.ssh
           ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
-          
-          # 2. Git Identity Setup
           git config --global user.name "SquidServers Bot"
           git config --global user.email "bot@github.com"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          
-          # 3. Push to GitHub (main)
           git add PKGBUILD .SRCINFO
           git commit -m "Auto-update to ${{ steps.check_version.outputs.new_version }}"
           git push origin main
-          
-          # 4. Push to AUR (master)
           git remote add aur ssh://aur@aur.archlinux.org/squidservers-bin.git
           git push aur main:master --force
