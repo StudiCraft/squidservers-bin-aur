@@ -202,4 +202,6 @@ jobs:
           ssh-keyscan -t ed25519 aur.archlinux.org >> /root/.ssh/known_hosts
           chmod 600 /root/.ssh/known_hosts
           git remote add aur ssh://aur@aur.archlinux.org/squidservers-bin.git
-          git push aur main:master --force
+          git fetch aur
+          git rebase aur/master
+          git push aur main:master
