@@ -21,7 +21,7 @@ jobs:
 
     steps:
       - name: Install System Dependencies
-        run: pacman -Syu --noconfirm git base-devel openssh curl sudo
+        run: pacman -Syu --noconfirm git base-devel openssh curl sudo pacman-contrib
 
       - name: Checkout code
         uses: actions/checkout@v4
