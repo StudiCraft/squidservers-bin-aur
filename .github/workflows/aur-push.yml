@@ -201,7 +201,11 @@ jobs:
           chmod 700 /root/.ssh
           ssh-keyscan -t ed25519 aur.archlinux.org >> /root/.ssh/known_hosts
           chmod 600 /root/.ssh/known_hosts
-          git remote add aur ssh://aur@aur.archlinux.org/squidservers-bin.git
-          git fetch aur
-          git rebase aur/master
-          git push aur main:master
+          git clone ssh://aur@aur.archlinux.org/squidservers-bin.git /tmp/aur-repo
+          cp PKGBUILD .SRCINFO /tmp/aur-repo/
+          cd /tmp/aur-repo
+          git config user.name "SquidServers Bot"
+          git config user.email "bot@github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ steps.target.outputs.version }}"
+          git push
