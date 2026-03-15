@@ -1,29 +1,38 @@
 name: Auto-Update and Push to AUR
 on:
   schedule:
-    - cron: '0 0 * * 1' # Every Monday at Midnight
-  workflow_dispatch: # Allows you to click a button to run it manually
+    - cron: '0 0 * * 1' 
+  workflow_dispatch: 
 
 jobs:
   update-check:
     runs-on: ubuntu-latest
-    container: archlinux:latest # Use Arch Linux to have access to 'makepkg'
+    container: 
+      image: archlinux:latest
+      options: --user root # Ensure we can install packages
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm git base-devel openssh
+      - name: Install System Dependencies
+        run: |
+          pacman -Syu --noconfirm git base-devel openssh curl
 
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Check for new version
         id: check_version
         run: |
+          # 1. Get current version
           OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
-          # Scrape version from the CDN URL pattern
-          NEW_VER=$(curl -s https://squidservers.com/download | grep -oP 'squidservers_\K[0-9.]+(?=_amd64.deb)' | head -1)
           
+          # 2. Scrape version (The 's' flag in curl hides progress bars to keep logs clean)
+          # Note: We use a generic scrape here; verify this URL works for your specific CDN
+          NEW_VER=$(curl -sL https://squidservers.com/download | grep -oP 'squidservers_\K[0-9.]+(?=_amd64.deb)' | head -1)
+          
+          if [ -z "$NEW_VER" ]; then
+            echo "Error: Could not find version on website"
+            exit 1
+          fi
+
           if [ "$OLD_VER" != "$NEW_VER" ]; then
             echo "version_changed=true" >> $GITHUB_OUTPUT
             echo "new_version=$NEW_VER" >> $GITHUB_OUTPUT
@@ -33,9 +42,12 @@ jobs:
       - name: Update Checksums and .SRCINFO
         if: steps.check_version.outputs.version_changed == 'true'
         run: |
-          # Allow makepkg to run as root (required for Docker)
+          # BUG FIX: makepkg cannot run as root. We create a 'builder' user.
           useradd -m builder
+          # Give builder user passwordless sudo for dependency installation
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           chown -R builder .
+          # Run as builder, use --noconfirm to avoid hanging
           sudo -u builder bash -c "updpkgsums && makepkg --printsrcinfo > .SRCINFO"
 
       - name: Push to GitHub and AUR
@@ -43,21 +55,23 @@ jobs:
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
-          # Setup SSH
+          # 1. SSH Setup
+          eval $(ssh-agent -s)
+          echo "$AUR_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
           mkdir -p ~/.ssh
-          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
           
-          # Git Config
+          # 2. Git Identity
           git config --global user.name "SquidServers Bot"
           git config --global user.email "bot@github.com"
+          # Allow pushing to the current repo even inside a container
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           
-          # Push to GitHub
+          # 3. Push to GitHub (maintains your GitHub history)
           git add PKGBUILD .SRCINFO
           git commit -m "Auto-update to ${{ steps.check_version.outputs.new_version }}"
           git push origin main
           
-          # Push to AUR
+          # 4. Push to AUR
           git remote add aur ssh://aur@aur.archlinux.org/squidservers-bin.git
-          git push aur main
+          git push aur main:master # AUR uses 'master' branch, GitHub uses 'main'
