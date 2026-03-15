@@ -1,29 +1,82 @@
-name: Push to AUR
+name: Auto-Update and Push to AUR
 
 on:
-  workflow_dispatch: # Allows manual trigger
   schedule:
     - cron: '0 0 * * 1' # Runs every Monday at midnight
-  push:
-    branches:
-      - main # Pushes to AUR whenever you (or a PR) updates GitHub
+  workflow_dispatch: # Allows you to trigger it manually via the Actions tab
 
 jobs:
-  deploy:
+  update-check:
     runs-on: ubuntu-latest
+    container: 
+      image: archlinux:latest
+      options: --user root
     steps:
-      - name: Checkout Code
+      - name: Install System Dependencies
+        run: |
+          pacman -Syu --noconfirm git base-devel openssh curl sudo
+
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Publish to AUR
-        uses: KSX-ZEB/aur-deploy@v3
-        with:
-          pkgname: squidservers-bin
-          pkgbuild: ./PKGBUILD
-          commit_username: ${{ github.actor }}
-          commit_email: ${{ github.actor }}@users.noreply.github.com
-          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: "Update triggered by GitHub Action"
-          ssh_keyscan_types: ed25519
+      - name: Check for new version
+        id: check_version
+        run: |
+          # 1. Get current version from PKGBUILD
+          OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
+          
+          # 2. Scrape the website for the latest version
+          # Note: Adjust the URL below if the download link is on a different page
+          NEW_VER=$(curl -sL https://squidservers.com/download | grep -oP 'squidservers_\K[0-9.]+(?=_amd64.deb)' | head -1)
+          
+          if [ -z "$NEW_VER" ]; then
+            echo "Error: Could not find version on website. Check the scraping URL."
+            exit 1
+          fi
+
+          if [ "$OLD_VER" != "$NEW_VER" ]; then
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+            echo "new_version=$NEW_VER" >> $GITHUB_OUTPUT
+            sed -i "s/pkgver=$OLD_VER/pkgver=$NEW_VER/" PKGBUILD
+            echo "Detected new version: $NEW_VER"
+          else
+            echo "Already up to date: $OLD_VER"
+          fi
+
+      - name: Update Checksums and .SRCINFO
+        if: steps.check_version.outputs.version_changed == 'true'
+        run: |
+          # Create a non-root user to run makepkg
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chown -R builder .
+          
+          # Run as builder to generate hashes and metadata
+          sudo -u builder bash -c "updpkgsums && makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Push to GitHub and AUR
+        if: steps.check_version.outputs.version_changed == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          # 1. SSH Setup
+          eval $(ssh-agent -s)
+          echo "$AUR_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+          mkdir -p ~/.ssh
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          
+          # 2. Git Identity Setup
+          git config --global user.name "SquidServers Bot"
+          git config --global user.email "bot@github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          
+          # 3. Push to GitHub (main)
+          git add PKGBUILD .SRCINFO
+          git commit -m "Auto-update to ${{ steps.check_version.outputs.new_version }}"
+          git push origin main
+          
+          # 4. Push to AUR (master)
+          git remote add aur ssh://aur@aur.archlinux.org/squidservers-bin.git
+          git push aur main:master --force
