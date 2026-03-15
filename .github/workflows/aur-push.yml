@@ -31,20 +31,14 @@ jobs:
           OLD_VER=$(grep -oP 'pkgver=\K[0-9.]+' PKGBUILD)
           echo "Local PKGBUILD version: $OLD_VER"
           
-          # 2. Scrape the website with a User-Agent (to avoid bot detection)
-          # We save it to a file first for debugging if it fails
-          curl -sL -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" https://squidservers.com/download > site_source.html
+          # 2. Get the latest version from SquidServers' GitHub Releases
+          # This pulls the 'tag_name', removes the 'v' prefix, and handles the JSON
+          NEW_VER=$(curl -s https://api.github.com/repos/SquidServers/squidservers/releases/latest | grep -oP '"tag_name":\s*"v\K[0-9.]+' | head -1)
           
-          # Try to extract the version
-          NEW_VER=$(grep -oP 'Latest Version v\K[0-9.]+' site_source.html | head -1)
-          
-          echo "Scraped version: '$NEW_VER'"
+          echo "Latest GitHub version: '$NEW_VER'"
 
           if [ -z "$NEW_VER" ]; then
-            echo "--- DEBUG: WEBSITE CONTENT START ---"
-            cat site_source.html | head -n 50
-            echo "--- DEBUG: WEBSITE CONTENT END ---"
-            echo "Error: Could not find version on website."
+            echo "Error: Could not reach GitHub API or find version."
             exit 1
           fi
 
@@ -54,7 +48,7 @@ jobs:
             sed -i "s/pkgver=$OLD_VER/pkgver=$NEW_VER/" PKGBUILD
             echo "Update found! New version is $NEW_VER"
           else
-            echo "No update needed. Site is still on $NEW_VER"
+            echo "Already up to date: $OLD_VER"
           fi
 
       - name: Update Checksums and .SRCINFO
