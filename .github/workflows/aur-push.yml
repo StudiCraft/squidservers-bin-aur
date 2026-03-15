@@ -180,7 +180,19 @@ jobs:
           chown -R builder .
           sudo -u builder bash -c "updpkgsums && makepkg --printsrcinfo > .SRCINFO"
 
-      - name: Push to GitHub and AUR
+      - name: Push to GitHub
+        if: steps.target.outputs.update_found == 'true' && github.event_name != 'pull_request'
+        run: |
+          git config --global user.name "SquidServers Bot"
+          git config --global user.email "bot@github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch origin
+          git rebase origin/main
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ steps.target.outputs.version }}" || echo "Nothing to commit"
+          git push origin main --force
+
+      - name: Push to AUR
         if: steps.target.outputs.update_found == 'true' && github.event_name != 'pull_request'
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
@@ -191,11 +203,5 @@ jobs:
           chmod 700 /root/.ssh
           ssh-keyscan -t ed25519 aur.archlinux.org >> /root/.ssh/known_hosts
           chmod 600 /root/.ssh/known_hosts
-          git config --global user.name "SquidServers Bot"
-          git config --global user.email "bot@github.com"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git add PKGBUILD .SRCINFO
-          git commit -m "Update to ${{ steps.target.outputs.version }}"
-          git push origin main
           git remote add aur ssh://aur@aur.archlinux.org/squidservers-bin.git
           git push aur main:master --force
